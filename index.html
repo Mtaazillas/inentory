@@ -518,59 +518,59 @@ body{font-family:'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--tex
 <datalist id="cat-dl"></datalist>
 <div class="toast" id="toast"></div>
 
-<!-- Firebase (Realtime Database) — makes the inventory live/shared across every visitor.
-     Fill in FIREBASE_CONFIG below with your own free project keys (see setup notes shared
-     alongside this file). Until you do, the app runs exactly as before, saved to this
-     browser only. -->
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <script>
 // ══════════════════════════════════════════════════════
-// STORAGE — shared keys with database.html
-// Backed by Firebase Realtime Database when configured below,
-// so every visitor sees the same live data and history.
-// Falls back to this-browser-only storage if not configured.
+// STORAGE — shared, live, and persistent
+// Uses this artifact's built-in shared storage: every person who opens
+// this page (this device, a teammate's device, tomorrow, next week) reads
+// and writes the exact same data. No accounts, no keys, no setup — it
+// just feels like ordinary local storage, but it's actually shared.
+// Keys are shared with database.html so both pages see one live dataset.
 // ══════════════════════════════════════════════════════
-const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyDZYDdehqV5J5FS1GaYRui4dDo7V__o_LI",
-  authDomain: "inventory-7fad0.firebaseapp.com",
-  databaseURL: "https://inventory-7fad0-default-rtdb.firebaseio.com",
-  projectId: "inventory-7fad0",
-};
-const FIREBASE_ENABLED = FIREBASE_CONFIG.apiKey !== "AIzaSyDZYDdehqV5J5FS1GaYRui4dDo7V__o_LI" && !!FIREBASE_CONFIG.databaseURL;
 const SYNC_KEYS = ['users','items','checkouts','log','sections_def'];
-let fdb = null;
-if (FIREBASE_ENABLED) {
-  try { firebase.initializeApp(FIREBASE_CONFIG); fdb = firebase.database(); }
-  catch(e) { console.warn('Firebase init failed — running in local-only mode.', e); }
-}
 const CACHE = {};
-SYNC_KEYS.forEach(k => { try { CACHE[k] = JSON.parse(localStorage.getItem(k)); } catch(e) { CACHE[k] = null; } });
+const saveTimers = {};
 
 const S = {
   get: k => CACHE[k],
   set: (k,v) => {
     CACHE[k] = v;
-    try { localStorage.setItem(k, JSON.stringify(v)); localStorage.setItem('_bc', JSON.stringify({k,t:Date.now()})); } catch(e){}
-    if (fdb) { fdb.ref(k).set(v).catch(e => console.warn('Sync write failed (saved locally, will not sync until online):', e)); }
+    clearTimeout(saveTimers[k]);
+    saveTimers[k] = setTimeout(() => persistKey(k), 120);
   },
   ts: () => new Date().toISOString(),
   fmt: iso => { if(!iso) return '—'; const d=new Date(iso); return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}); }
 };
 
-// Waits for the first real answer from Firebase for every key (so a fresh device never
-// stomps shared data with empty defaults), then keeps re-rendering live as data changes.
+async function persistKey(k) {
+  try { await window.storage.set('studio:'+k, JSON.stringify(CACHE[k] ?? null), true); }
+  catch(e) { /* will retry on the next change; nothing to show the user */ }
+}
+async function fetchKey(k) {
+  try { const r = await window.storage.get('studio:'+k, true); return r ? JSON.parse(r.value) : null; }
+  catch(e) { return null; }
+}
+
+// Loads the live shared data once, then polls quietly in the background so
+// every visitor's screen stays current with what everyone else is doing.
 function initSync(onReady) {
-  if (!fdb) { onReady(); return; }
-  let pending = SYNC_KEYS.length, ready = false;
-  SYNC_KEYS.forEach(k => {
-    fdb.ref(k).on('value', snap => {
-      if (snap.exists()) { CACHE[k] = snap.val(); try{ localStorage.setItem(k, JSON.stringify(CACHE[k])); }catch(e){} }
-      if (!ready) { pending--; if (pending<=0) { ready = true; onReady(); } }
-      else { window.dispatchEvent(new CustomEvent('data-sync', {detail:k})); }
-    }, err => { console.warn('Sync read failed for', k, err); if (!ready) { pending--; if (pending<=0){ready=true; onReady();} } });
-  });
+  (async () => {
+    for (const k of SYNC_KEYS) {
+      const v = await fetchKey(k);
+      if (v !== null) CACHE[k] = v;
+    }
+    onReady();
+    setInterval(async () => {
+      for (const k of SYNC_KEYS) {
+        const v = await fetchKey(k);
+        if (v !== null && JSON.stringify(v) !== JSON.stringify(CACHE[k])) {
+          CACHE[k] = v;
+          window.dispatchEvent(new CustomEvent('data-sync', {detail:k}));
+        }
+      }
+    }, 3500);
+  })();
 }
 
 // ── SEED DEFAULTS ──────────────────────────────────────
@@ -621,7 +621,6 @@ function doEntry() {
     const newUser = {id:Date.now(),name:typed,role:'Manager',av:typed.slice(0,2).toUpperCase(),color:'#1D6F42',permissions:['view','checkout','return','restock','add','remove','sections','feed','manage'],sections:['inv','checkout','reports','archive'],suspended:false,suspendUntil:null,suspendReason:'',inventoryAccess:true,lastSeen:S.ts()};
     S.set('users', [newUser]);
     session = {...newUser};
-    sessionStorage.setItem('inv_session', JSON.stringify(session));
     addLog({type:'login', uid:newUser.id, user:newUser.name, title:`${newUser.name} logged into Inventory`, detail:`Role: ${newUser.role} (first account — admin)`});
     enterApp();
     return;
@@ -638,7 +637,6 @@ function doEntry() {
 
   // Check suspended
   if (isSus(user)) {
-    sessionStorage.setItem('inv_session', JSON.stringify({...user}));
     showSusWall(user);
     return;
   }
@@ -665,7 +663,6 @@ function doEntry() {
 
   // ✓ All good
   session = {...user};
-  sessionStorage.setItem('inv_session', JSON.stringify(session));
   // update lastSeen
   const idx = users.findIndex(u => u.id === user.id);
   if (idx >= 0) { users[idx].lastSeen = S.ts(); S.set('users', users); }
@@ -702,7 +699,6 @@ function resetToEntry() {
   document.getElementById('entry-name').value = '';
   document.getElementById('entry-err').textContent = '';
   document.getElementById('entry-btn').disabled = true;
-  sessionStorage.removeItem('inv_session');
   session = null;
 }
 
@@ -734,8 +730,8 @@ function enterApp() {
   setSyncing('ok');
   renderAll();
   startClock();
-  // Re-check session whenever data changes — same-tab (storage event) or
-  // live from any other device/visitor (data-sync event from Firebase).
+  // Re-check session whenever data changes anywhere — another device or
+  // visitor editing this shared workspace fires a data-sync event here.
   function handleRemoteChange() {
     if (!session) return;
     const users = S.get('users') || [];
@@ -753,7 +749,6 @@ function enterApp() {
     }
     if (!(fresh.permissions||[]).includes('view')) { doLogout(); return; }
     session = {...fresh};
-    sessionStorage.setItem('inv_session', JSON.stringify(session));
     const perms = session.permissions || [];
     document.getElementById('rbtn-checkout').style.display = perms.includes('checkout') ? 'flex' : 'none';
     document.getElementById('rbtn-return').style.display = perms.includes('return') ? 'flex' : 'none';
@@ -761,9 +756,6 @@ function enterApp() {
     document.getElementById('rbtn-scan').style.display = (perms.includes('add') || session.name === 'Muli') ? 'flex' : 'none';
     renderAll();
   }
-  window.addEventListener('storage', e => {
-    if (e.key === 'users' || e.key === '_bc') handleRemoteChange(); else renderAll();
-  });
   window.addEventListener('data-sync', e => {
     if (e.detail === 'users') handleRemoteChange(); else renderAll();
   });
@@ -780,22 +772,8 @@ function startClock() {
 // ══════════════════════════════════════════════════════
 function checkSession() {
   seedDefaults();
-  const raw = sessionStorage.getItem('inv_session');
-  if (raw) {
-    try {
-      const saved = JSON.parse(raw);
-      const users = S.get('users') || [];
-      const fresh = users.find(u => u.id === saved.id);
-      if (fresh && !isSus(fresh) && fresh.inventoryAccess !== false && (fresh.permissions||[]).includes('view')) {
-        session = {...fresh};
-        sessionStorage.setItem('inv_session', JSON.stringify(session));
-        enterApp();
-        return;
-      }
-      sessionStorage.removeItem('inv_session');
-    } catch(e) { sessionStorage.removeItem('inv_session'); }
-  }
-  // Show entry screen fresh
+  // Every visit starts fresh at the name-entry screen — nothing is
+  // remembered in the browser, so who's "you" is always typed anew.
   document.getElementById('entry-screen').style.display = 'flex';
 }
 
